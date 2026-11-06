@@ -11,6 +11,8 @@ Flujo:
      y registra el checkpoint en output/.checkpoint.json.
   5. Al volver a ejecutar: carga el checkpoint y omite los pasos ya aprobados,
      inyectando sus outputs como contexto para los pasos restantes.
+  6. Si quedan cambios en output/ sin integrar, ofrece el paso DevOps (PR hacia ai-labs): al arrancar,
+     solo ese paso; o al terminar el flujo completo.
 
 Estructura generada en output/:
   .checkpoint.json        ← estado de cada paso
@@ -62,6 +64,8 @@ from crewai import Crew, Process
 
 from crew.workflow import build_tasks, include_data, workflow_steps
 from agents.architect import agent as architect_agent
+from agents import devops as devops_agent
+import integration
 
 # ── MCP clients ────────────────────────────────────────────────────
 from mcp_projects import (
@@ -70,6 +74,7 @@ from mcp_projects import (
     list_project_items,
     get_feature_from_item,
 )
+from mcp_github import create_pull_request
 from hex_archetype import HEX_PROMPT_PREFIX
 
 # ── Flag de verbosidad MCP ─────────────────────────────────────────
@@ -860,12 +865,128 @@ def build_context_note(approved_outputs: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# DEVOPS — integración vía PR
+# ═══════════════════════════════════════════════════════════════════
+
+def _ask_yes_no(question: str) -> bool:
+    """Solo una afirmación explícita cuenta como sí; cualquier otra cosa es no."""
+    try:
+        answer = input(question).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("s", "si", "sí", "y", "yes")
+
+
+def _approved_outputs(checkpoint: dict) -> dict:
+    return {k: v.get("output", "") for k, v in checkpoint.get("steps", {}).items()
+            if isinstance(v, dict) and v.get("status") == "approved"}
+
+
+def _flow_complete(checkpoint: dict, steps) -> bool:
+    approved = _approved_outputs(checkpoint)
+    return all(step[0] in approved for step in steps)
+
+
+def _print_pending(pending: dict) -> None:
+    print(f"  · {len(pending['new'])} archivo(s) nuevo(s), {len(pending['modified'])} modificado(s) desde la última integración.")
+    for label, key in (("nuevo", "new"), ("modificado", "modified")):
+        for path in pending[key][:10]:
+            print(f"    - {label}: {path}")
+        if len(pending[key]) > 10:
+            print(f"    ... y {len(pending[key]) - 10} más ({label})")
+
+
+def _feature_from_checkpoint(checkpoint: dict) -> dict:
+    feature = checkpoint.get("feature")
+    if isinstance(feature, dict) and feature.get("title"):
+        return feature
+    story = OUTPUT_DIR / "specs" / "user_story.md"
+    description = story.read_text(encoding="utf-8")[:4000] if story.exists() else ""
+    return {"title": checkpoint.get("feature_title", ""), "description": description, "acceptance_criteria": []}
+
+
+def run_devops_step(feature: dict, checkpoint: dict) -> bool:
+    """Paso DevOps: clona ai-labs, el agente redacta el PR, tras aprobación se sube la rama y se abre el PR."""
+    owner = os.getenv("DEVOPS_TARGET_OWNER") or os.getenv("GITHUB_OWNER", "")
+    repo  = os.getenv("DEVOPS_TARGET_REPO", "ai-labs")
+    base  = os.getenv("DEVOPS_BASE_BRANCH", "main")
+
+    print(f"\n{'─'*60}\n▶ PASO: {devops_agent.LABEL} → {owner}/{repo} (base: {base})\n{'─'*60}")
+    files = integration.output_files(OUTPUT_DIR)
+    try:
+        staging = integration.stage_changes(OUTPUT_DIR, files, integration.repo_url(owner, repo), base)
+    except (ValueError, RuntimeError) as exc:
+        print(f"\n❌ No se pudo preparar la integración: {exc}")
+        return False
+
+    steps_state = checkpoint.setdefault("steps", {})
+    approved_outputs = _approved_outputs(checkpoint)
+    try:
+        user_feedback = ""
+        while True:
+            task = devops_agent.build_task(feature)
+            task.description += build_context_note(approved_outputs) + integration.describe_changes(staging)
+            if user_feedback:
+                task.description += (
+                    f"\n\n---\n## ⚠️ INSTRUCCIONES ESPECÍFICAS DE CORRECCIÓN (FEEDBACK HUMANO):\n"
+                    f"{user_feedback}\n"
+                )
+
+            output = run_step(devops_agent.agent, task)
+            decision, user_feedback = hitl_approve(devops_agent.LABEL, output)
+
+            if decision == "r":
+                print("\n🔄 Reintentando...")
+                continue
+            if decision == "n":
+                print(f"\n❌ {devops_agent.LABEL} rechazado. No se subió nada.")
+                steps_state["devops"] = {"status": "rejected", "output": output}
+                save_checkpoint(checkpoint)
+                return False
+
+            draft  = integration.parse_draft(output, feature.get("title", ""))
+            branch = integration.unique_branch(draft.branch)
+            try:
+                integration.commit_and_push(staging, branch, draft.commit)
+            except (ValueError, RuntimeError) as exc:
+                print(f"\n❌ No se pudo subir la rama: {exc}")
+                return False
+            try:
+                pr = create_pull_request(draft.title, draft.body, branch, base)
+            except RuntimeError as exc:
+                print(f"\n❌ La rama '{branch}' se subió, pero no se pudo abrir el PR: {exc}")
+                return False
+
+            pr_url = pr.get("url") or f"(PR #{pr.get('number')})"
+            print(f"\n✅ PR abierto: {pr_url}")
+            save_spec(devops_agent.SPEC_FILE, f"{output}\n\n---\nPR: {pr_url}\nRama: {branch}\n")
+            steps_state["devops"] = {"status": "approved", "output": output}
+            save_checkpoint(checkpoint)
+            integration.save_manifest(OUTPUT_DIR, files, pr_url, branch)
+            return True
+    finally:
+        integration.cleanup(staging)
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
     with_data = include_data()
     steps = workflow_steps(with_data)
+
+    # ── Cambios por integrar de una ejecución anterior → ofrecer solo DevOps ──
+    prior = load_checkpoint()
+    mode_now = "with-data" if with_data else "standard"
+    if prior.get("workflow_mode", "standard") == mode_now and _flow_complete(prior, steps):
+        pending = integration.pending_changes(OUTPUT_DIR)
+        if pending["new"] or pending["modified"]:
+            print("\n[DevOps] Hay cambios generados por el flujo que aún no se integran en el repo destino:")
+            _print_pending(pending)
+            if _ask_yes_no("\n¿Iniciar el flujo solo por el paso DevOps (integración vía PR)? [s/n]: "):
+                run_devops_step(_feature_from_checkpoint(prior), prior)
+                return
     # ── MCP Proyectos: descubrir tools ────────────────────────────────
     print("\n[MCP Proyectos] Autenticando...")
     _proj_tools = proj_tools()
@@ -943,6 +1064,7 @@ def main():
         raise SystemExit(1)
     checkpoint["workflow_mode"] = mode
     checkpoint["feature_title"] = feature["title"]
+    checkpoint["feature"] = feature
 
     # ── Recuperar outputs aprobados del checkpoint ────────────────────
     approved_outputs: dict = {}
@@ -1057,6 +1179,13 @@ def main():
     print("=" * 60)
     print("\nVEREDICTO del Chapter (extracto):")
     print(chapter_text[-500:] if len(chapter_text) > 500 else chapter_text)
+
+    pending = integration.pending_changes(OUTPUT_DIR)
+    if pending["new"] or pending["modified"]:
+        print("\n[DevOps] Hay cambios generados que aún no se integran en el repo destino:")
+        _print_pending(pending)
+        if _ask_yes_no("\n¿Integrarlos ahora vía PR? [s/n]: "):
+            run_devops_step(feature, checkpoint)
 
 
 if __name__ == "__main__":

@@ -92,6 +92,24 @@ Los artefactos se guardan en `output/`:
 - `backend-quarkus/` y `frontend-angular/`: código extraído y configuración de arranque.
 - `.checkpoint.json`: estado local de la ejecución.
 
+## Integrar vía PR (DevOps)
+
+Al terminar el flujo, `main.py` ofrece integrar `output/` en el repo `ai-labs`. Si ya hay cambios sin integrar de una ejecución anterior,
+`python main.py` lo detecta al arrancar y pregunta si quieres iniciar solo por el paso DevOps, sin repetir los demás.
+
+El agente `agents/devops.py` redacta el PR; tras tu aprobación (`s/r/n`) Python clona `ai-labs`, copia los archivos a la raíz,
+sube una rama `crewai/...` con git y abre el PR por el MCP `github-local` (`github-project`, puerto 8083).
+No se suben `target/`, `node_modules/` ni los archivos de estado. Lo integrado se registra en `output/.integration.json`.
+
+Requisitos: sesión de git con permiso de push a `ai-labs` (por ejemplo `gh auth login`) y el MCP en :8083 levantado con el mismo owner y repo destino:
+
+```sh
+cd support/mcp-local
+bash start-mcp.sh --owner OWNER_DE_AI_LABS --repo ai-labs
+```
+
+Configura `DEVOPS_TARGET_OWNER`, `DEVOPS_TARGET_REPO`, `DEVOPS_BASE_BRANCH` y `GITHUB_LOCAL_MCP_URL` en `.env` (ver `.env.example`).
+
 ## Probar la solución generada
 
 Con Java 17 o superior y Maven instalados, abre una terminal en `output/backend-quarkus`:
